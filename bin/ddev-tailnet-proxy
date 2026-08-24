@@ -296,10 +296,6 @@ show_status() {
   else
     printf 'No refresh state is available. Run sudo %s refresh.\n' "$PROGRAM"
   fi
-  if command -v systemctl >/dev/null; then
-    printf '\n'
-    systemctl --no-pager --full status ddev-tailnet-proxy.timer ddev-tailnet-proxy.service 2>&1 || true
-  fi
 }
 
 config_command() {
