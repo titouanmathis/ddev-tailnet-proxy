@@ -24,7 +24,7 @@ DOCKER_NETWORK=$DEFAULT_NETWORK
 NODE_DNS=""
 
 fail() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
-log() { printf '[%(%FT%T%z)T] %s\n' -1 "$*"; }
+log() { printf '[%(%FT%T%z)T] %s\n' -1 "$*" >&2; }
 require_root() { [[ $EUID -eq 0 ]] || fail "run this command as root (use sudo)"; }
 
 usage() {

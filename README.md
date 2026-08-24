@@ -22,7 +22,7 @@ Add this to `mise.toml`:
 
 ```toml
 [tools]
-"github:titouanmathis/ddev-tailnet-proxy" = "0.1.1"
+"github:titouanmathis/ddev-tailnet-proxy" = "0.1.2"
 ```
 
 Then install the system service:
@@ -38,9 +38,9 @@ Mise's GitHub backend finds the executable at `bin/ddev-tailnet-proxy` in the re
 Download the release archive and its checksum from GitHub. Verify it, then put `bin/ddev-tailnet-proxy` on your `PATH`:
 
 ```sh
-sha256sum -c ddev-tailnet-proxy-0.1.1.tar.gz.sha256
-tar -xzf ddev-tailnet-proxy-0.1.1.tar.gz
-sudo install -m 755 ddev-tailnet-proxy-0.1.1/bin/ddev-tailnet-proxy /usr/local/bin/ddev-tailnet-proxy
+sha256sum -c ddev-tailnet-proxy-0.1.2.tar.gz.sha256
+tar -xzf ddev-tailnet-proxy-0.1.2.tar.gz
+sudo install -m 755 ddev-tailnet-proxy-0.1.2/bin/ddev-tailnet-proxy /usr/local/bin/ddev-tailnet-proxy
 sudo ddev-tailnet-proxy service install
 ```
 
@@ -89,10 +89,10 @@ The generated Nginx configuration disables upstream TLS verification because DDE
 No Node.js, npm, or Make is required. Create a GitHub release asset with standard Linux utilities:
 
 ```sh
-scripts/release.sh 0.1.1
+scripts/release.sh 0.1.2
 ```
 
-This creates `dist/ddev-tailnet-proxy-0.1.1.tar.gz` and a checksum file that verifies when downloaded beside the archive. Upload both files to a GitHub release with the matching tag.
+This creates `dist/ddev-tailnet-proxy-0.1.2.tar.gz` and a checksum file that verifies when downloaded beside the archive. Upload both files to a GitHub release with the matching tag.
 
 Run the minimal validation:
 
