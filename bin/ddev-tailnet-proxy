@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Expose running DDEV projects on stable HTTPS ports of this Tailscale node.
+set -euo pipefail
+
+readonly PROGRAM="ddev-tailnet-proxy"
+readonly CONFIG_DIR="${DDEV_TAILNET_PROXY_CONFIG_DIR:-/etc/ddev-tailnet-proxy}"
+readonly STATE_DIR="${DDEV_TAILNET_PROXY_STATE_DIR:-/var/lib/ddev-tailnet-proxy}"
+readonly LOG_DIR="${DDEV_TAILNET_PROXY_LOG_DIR:-/var/log/ddev-tailnet-proxy}"
+readonly CONFIG_FILE="$CONFIG_DIR/config"
+readonly PORTS_FILE="$STATE_DIR/ports.tsv"
+readonly SERVED_PORTS_FILE="$STATE_DIR/served-ports.tsv"
+readonly NGINX_CONF="$STATE_DIR/nginx.conf"
+readonly CONTAINER_NAME="ddev-tailnet-proxy"
+readonly DEFAULT_BASE_PORT=19001
+readonly DEFAULT_NETWORK=ddev_default
+readonly SYSTEM_BIN=/usr/local/bin/ddev-tailnet-proxy
+readonly SERVICE_UNIT=/etc/systemd/system/ddev-tailnet-proxy.service
+readonly TIMER_UNIT=/etc/systemd/system/ddev-tailnet-proxy.timer
+
+BASE_PORT=$DEFAULT_BASE_PORT
+DOCKER_NETWORK=$DEFAULT_NETWORK
+NODE_DNS=""
+
+fail() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
+log() { printf '[%(%FT%T%z)T] %s\n' -1 "$*"; }
+require_root() { [[ $EUID -eq 0 ]] || fail "run this command as root (use sudo)"; }
+
+usage() {
+  cat <<'EOF'
+Usage: ddev-tailnet-proxy <command>
+
+Commands:
+  refresh                   Discover running DDEV projects and update proxying.
+  status                    Show the node name, projects, and systemd state.
+  config set-node-dns NAME  Override the Tailscale DNS name for this node.
+  config unset-node-dns     Use the DNS name from `tailscale status --json`.
+  config show               Show effective configuration.
+  service install           Install the root systemd service and two-minute timer.
+  service uninstall         Stop and remove the systemd service and timer.
+  service status            Show service and timer state.
+  help                      Show this help.
+
+Environment overrides (for testing only):
+  DDEV_TAILNET_PROXY_CONFIG_DIR, DDEV_TAILNET_PROXY_STATE_DIR,
+  DDEV_TAILNET_PROXY_LOG_DIR
+EOF
+}
+
+load_config() {
+  BASE_PORT=$DEFAULT_BASE_PORT
+  DOCKER_NETWORK=$DEFAULT_NETWORK
+  NODE_DNS=""
+  [[ -f $CONFIG_FILE ]] || return 0
+  # The file is root-owned and written only by this program. It uses simple KEY=VALUE lines.
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+  [[ $BASE_PORT =~ ^[1-9][0-9]{0,4}$ && $BASE_PORT -le 65535 ]] || fail "invalid BASE_PORT in $CONFIG_FILE"
+  [[ $DOCKER_NETWORK =~ ^[A-Za-z0-9_.-]+$ ]] || fail "invalid DOCKER_NETWORK in $CONFIG_FILE"
+  [[ -z $NODE_DNS || $NODE_DNS =~ ^[A-Za-z0-9.-]+$ ]] || fail "invalid NODE_DNS in $CONFIG_FILE"
+}
+
+write_config() {
+  require_root
+  umask 077
+  install -d -m 700 "$CONFIG_DIR"
+  {
+    printf 'BASE_PORT=%q\n' "$BASE_PORT"
+    printf 'DOCKER_NETWORK=%q\n' "$DOCKER_NETWORK"
+    printf 'NODE_DNS=%q\n' "$NODE_DNS"
+  } > "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+}
+
+node_dns() {
+  if [[ -n $NODE_DNS ]]; then
+    printf '%s\n' "${NODE_DNS%.}"
+    return
+  fi
+  command -v tailscale >/dev/null || fail "tailscale is required"
+  local dns
+  dns=$(tailscale status --json | awk '
+    /"Self"[[:space:]]*:[[:space:]]*\{/ { self=1; next }
+    self && /"DNSName"[[:space:]]*:/ {
+      line=$0; sub(/.*"DNSName"[[:space:]]*:[[:space:]]*"/, "", line); sub(/".*/, "", line); print line; exit
+    }
+  ')
+  [[ -n $dns ]] || fail "cannot detect this node DNS name; run: sudo $PROGRAM config set-node-dns NAME"
+  printf '%s\n' "${dns%.}"
+}
+
+init_paths() {
+  require_root
+  umask 077
+  install -d -m 700 "$CONFIG_DIR" "$STATE_DIR"
+  install -d -m 750 "$LOG_DIR"
+  [[ -f $PORTS_FILE ]] || : > "$PORTS_FILE"
+  [[ -f $SERVED_PORTS_FILE ]] || : > "$SERVED_PORTS_FILE"
+  chmod 600 "$PORTS_FILE" "$SERVED_PORTS_FILE"
+}
+
+port_in_use() {
+  local port=$1
+  if command -v ss >/dev/null; then
+    ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .
+  else
+    return 1
+  fi
+}
+
+port_is_allocated() { awk -F '\t' -v port="$1" '$2 == port { found=1 } END { exit !found }' "$PORTS_FILE"; }
+
+proxy_publishes_port() {
+  docker port "$CONTAINER_NAME" "$1/tcp" 2>/dev/null | grep -qx "127.0.0.1:$1"
+}
+
+tailscale_port_is_managed() {
+  grep -qx "$1" "$SERVED_PORTS_FILE" 2>/dev/null
+}
+
+tailscale_port_in_use() {
+  tailscale serve status --json | jq -e --arg port "$1" '[(.TCP[$port] != null), ((.Web // {}) | keys[]? | endswith(":" + $port))] | any' >/dev/null
+}
+
+next_free_port() {
+  local port=$BASE_PORT
+  while port_is_allocated "$port" || port_in_use "$port" || tailscale_port_in_use "$port"; do
+    ((port++))
+    ((port <= 65535)) || fail "no free TCP port remains"
+  done
+  printf '%s\n' "$port"
+}
+
+project_is_directly_exposed() {
+  docker inspect "ddev-$1-web" --format '{{range $p, $b := .NetworkSettings.Ports}}{{if or (eq $p "80/tcp") (eq $p "443/tcp")}}{{range $b}}{{.HostIp}}{{"\n"}}{{end}}{{end}}{{end}}' 2>/dev/null | grep -Eq '^(0\.0\.0\.0|::)$'
+}
+
+running_projects() {
+  docker ps --filter label=com.ddev.platform=ddev --filter label=com.docker.compose.service=web --format '{{.Label "com.ddev.site-name"}}' |
+    awk 'NF && $0 ~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ { print }' | sort -u
+}
+
+project_port() { awk -F '\t' -v project="$1" '$1 == project { print $2; exit }' "$PORTS_FILE"; }
+
+replace_project_port() {
+  local project=$1 port=$2 temporary="$PORTS_FILE.new"
+  awk -F '\t' -v project="$project" '$1 != project' "$PORTS_FILE" > "$temporary"
+  printf '%s\t%s\n' "$project" "$port" >> "$temporary"
+  mv "$temporary" "$PORTS_FILE"
+}
+
+ensure_project_port() {
+  local project=$1 port old_port
+  port=$(project_port "$project")
+  if [[ -n $port ]] && { { port_in_use "$port" && ! proxy_publishes_port "$port"; } || { tailscale_port_in_use "$port" && ! tailscale_port_is_managed "$port"; }; }; then
+    old_port=$port
+    port=$(next_free_port)
+    replace_project_port "$project" "$port"
+    log "reassigned $project from port $old_port to $port because its old port is in use"
+  elif [[ -z $port ]]; then
+    port=$(next_free_port)
+    printf '%s\t%s\n' "$project" "$port" >> "$PORTS_FILE"
+    log "registered $project on port $port"
+  fi
+  printf '%s\n' "$port"
+}
+
+generate_nginx_config() {
+  local public_dns=$1 active_file=$2 output=$3
+  {
+    # shellcheck disable=SC2016 # Nginx variables must remain literal in generated configuration.
+    printf 'events {}\nhttp {\n  resolver 127.0.0.11 ipv6=off valid=10s;\n\n  map $server_port $ddev_host {\n'
+    while IFS=$'\t' read -r project port; do
+      printf '    %s %s.ddev.site;\n' "$port" "$project"
+    done < "$active_file"
+    printf '  }\n\n  server {\n'
+    while IFS=$'\t' read -r _ port; do printf '    listen %s;\n' "$port"; done < "$active_file"
+    cat <<EOF
+
+    location / {
+      set \$ddev_router ddev-router;
+      proxy_pass https://\$ddev_router:443;
+      proxy_ssl_server_name on;
+      proxy_ssl_name \$ddev_host;
+      proxy_ssl_verify off;
+      proxy_set_header Host \$ddev_host;
+      proxy_set_header Accept-Encoding "";
+
+      proxy_redirect https://\$ddev_host/ https://$public_dns:\$server_port/;
+      proxy_cookie_domain \$ddev_host $public_dns;
+
+      sub_filter_types text/html text/css application/javascript application/json;
+      sub_filter_once off;
+      sub_filter https://\$ddev_host https://$public_dns:\$server_port;
+      sub_filter \$ddev_host $public_dns:\$server_port;
+    }
+  }
+}
+EOF
+  } > "$output"
+}
+
+stop_proxy() {
+  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+}
+
+apply_proxy() {
+  local active_file=$1 new_conf="$STATE_DIR/nginx.conf.new"
+  if [[ ! -s $active_file ]]; then
+    stop_proxy
+    rm -f "$NGINX_CONF"
+    return
+  fi
+  generate_nginx_config "$(node_dns)" "$active_file" "$new_conf"
+  if cmp -s "$new_conf" "$NGINX_CONF" 2>/dev/null && docker ps --filter "name=^${CONTAINER_NAME}$" --filter status=running -q | grep -q .; then
+    rm -f "$new_conf"
+    return
+  fi
+  mv "$new_conf" "$NGINX_CONF"
+  local -a publish_args=()
+  local port
+  while IFS=$'\t' read -r _ port; do publish_args+=(-p "127.0.0.1:$port:$port"); done < "$active_file"
+  stop_proxy
+  docker run -d --name "$CONTAINER_NAME" --restart unless-stopped --network "$DOCKER_NETWORK" "${publish_args[@]}" -v "$NGINX_CONF:/etc/nginx/nginx.conf:ro" nginx@sha256:4a73073bd557c65b759505da037898b61f1be6cbcc3c2c3aeac22d2a470c1752 >/dev/null
+  log "reloaded proxy container"
+}
+
+apply_tailscale_serve() {
+  local active_file=$1 port temporary="$SERVED_PORTS_FILE.new"
+  while IFS=$'\t' read -r _ port; do
+    if ! tailscale_port_is_managed "$port" && tailscale_port_in_use "$port"; then
+      fail "Tailscale Serve already uses port $port; choose another base port or remove that route"
+    fi
+    tailscale serve --bg --https="$port" "http://127.0.0.1:$port" >/dev/null
+    tailscale_port_is_managed "$port" || printf '%s\n' "$port" >> "$SERVED_PORTS_FILE"
+  done < "$active_file"
+  : > "$temporary"
+  while IFS= read -r port; do
+    if awk -F '\t' -v port="$port" '$2 == port { found=1 } END { exit !found }' "$active_file"; then
+      printf '%s\n' "$port" >> "$temporary"
+    else
+      tailscale serve --https="$port" off >/dev/null
+    fi
+  done < "$SERVED_PORTS_FILE"
+  mv "$temporary" "$SERVED_PORTS_FILE"
+}
+
+disable_managed_serve() {
+  local port
+  [[ -f $SERVED_PORTS_FILE ]] || return 0
+  command -v tailscale >/dev/null || fail "tailscale is required to remove managed Serve routes"
+  while IFS= read -r port; do tailscale serve --https="$port" off >/dev/null; done < "$SERVED_PORTS_FILE"
+  : > "$SERVED_PORTS_FILE"
+}
+
+refresh() {
+  require_root
+  command -v docker >/dev/null || fail "docker is required"
+  command -v tailscale >/dev/null || fail "tailscale is required"
+  command -v jq >/dev/null || fail "jq is required"
+  load_config
+  init_paths
+  exec 9>"$STATE_DIR/refresh.lock"
+  flock -n 9 || fail "a refresh is already running"
+  docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1 || fail "Docker network $DOCKER_NETWORK is missing; start a DDEV project first"
+  local active_file="$STATE_DIR/active.tsv" project port
+  : > "$active_file"
+  while IFS= read -r project; do
+    project_is_directly_exposed "$project" && { log "skipped $project: directly exposed on all interfaces"; continue; }
+    port=$(ensure_project_port "$project")
+    printf '%s\t%s\n' "$project" "$port" >> "$active_file"
+  done < <(running_projects)
+  sort -u -o "$PORTS_FILE" "$PORTS_FILE"
+  apply_proxy "$active_file"
+  apply_tailscale_serve "$active_file"
+  date --iso-8601=seconds > "$STATE_DIR/last-refresh"
+  log "refresh complete"
+}
+
+show_status() {
+  require_root
+  load_config
+  printf 'Node DNS: %s\n' "$(node_dns)"
+  printf 'Config: %s\nState: %s\n' "$CONFIG_DIR" "$STATE_DIR"
+  if [[ -s $PORTS_FILE ]]; then
+    printf '\n%-28s %s\n' PROJECT PORT
+    awk -F '\t' '{ printf "%-28s %s\n", $1, $2 }' "$PORTS_FILE"
+  else
+    printf '\nNo project ports are allocated.\n'
+  fi
+  if command -v systemctl >/dev/null; then
+    printf '\n'
+    systemctl --no-pager --full status ddev-tailnet-proxy.timer ddev-tailnet-proxy.service 2>&1 || true
+  fi
+}
+
+config_command() {
+  load_config
+  case ${1:-} in
+    set-node-dns)
+      require_root
+      [[ ${2:-} =~ ^[A-Za-z0-9.-]+$ ]] || fail "provide a valid DNS name"
+      NODE_DNS=${2%.}; write_config
+      ;;
+    unset-node-dns) require_root; NODE_DNS=""; write_config ;;
+    show) require_root; printf 'BASE_PORT=%s\nDOCKER_NETWORK=%s\nNODE_DNS=%s\n' "$BASE_PORT" "$DOCKER_NETWORK" "${NODE_DNS:-auto}" ;;
+    *) fail "Usage: $PROGRAM config [set-node-dns NAME|unset-node-dns|show]" ;;
+  esac
+}
+
+install_service() {
+  require_root
+  command -v systemctl >/dev/null || fail "systemd is required"
+  install -d -m 755 /usr/local/bin
+  local source_path
+  source_path=$(readlink -f "${BASH_SOURCE[0]}")
+  [[ $source_path == "$SYSTEM_BIN" ]] || install -m 755 "$source_path" "$SYSTEM_BIN"
+  cat > "$SERVICE_UNIT" <<'EOF'
+[Unit]
+Description=Refresh DDEV Tailnet Proxy
+After=docker.service tailscaled.service
+Wants=docker.service tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ddev-tailnet-proxy refresh
+EOF
+  cat > "$TIMER_UNIT" <<'EOF'
+[Unit]
+Description=Refresh DDEV Tailnet Proxy every two minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+Persistent=true
+Unit=ddev-tailnet-proxy.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now ddev-tailnet-proxy.timer
+  systemctl start ddev-tailnet-proxy.service
+  printf 'Installed %s and enabled its timer.\n' "$PROGRAM"
+}
+
+uninstall_service() {
+  require_root
+  command -v systemctl >/dev/null || fail "systemd is required"
+  systemctl disable --now ddev-tailnet-proxy.timer 2>/dev/null || true
+  systemctl stop ddev-tailnet-proxy.service 2>/dev/null || true
+  load_config
+  disable_managed_serve
+  stop_proxy
+  rm -f "$SERVICE_UNIT" "$TIMER_UNIT" "$SYSTEM_BIN"
+  systemctl daemon-reload
+  printf 'Removed systemd units and %s. State remains in %s.\n' "$PROGRAM" "$STATE_DIR"
+}
+
+service_command() {
+  case ${1:-} in
+    install) install_service ;;
+    uninstall) uninstall_service ;;
+    status) require_root; systemctl --no-pager --full status ddev-tailnet-proxy.timer ddev-tailnet-proxy.service ;;
+    *) fail "Usage: $PROGRAM service [install|uninstall|status]" ;;
+  esac
+}
+
+case ${1:-help} in
+  refresh) refresh ;;
+  status|list) show_status ;;
+  config) shift; config_command "$@" ;;
+  service) shift; service_command "$@" ;;
+  help|--help|-h) usage ;;
+  *) usage >&2; exit 1 ;;
+esac
