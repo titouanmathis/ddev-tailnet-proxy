@@ -279,8 +279,8 @@ refresh() {
   {
     printf 'Node DNS: %s\n' "$(node_dns)"
     if [[ -s $PORTS_FILE ]]; then
-      printf '\n%-28s %s\n' PROJECT PORT
-      awk -F '\t' '{ printf "%-28s %s\n", $1, $2 }' "$PORTS_FILE"
+      printf '\n%-28s %-6s %s\n' PROJECT PORT URL
+      awk -F '\t' -v node="$(node_dns)" '{ printf "%-28s %-6s https://%s:%s/\n", $1, $2, node, $2 }' "$PORTS_FILE"
     else
       printf '\nNo project ports are allocated.\n'
     fi
