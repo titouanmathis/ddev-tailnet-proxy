@@ -22,7 +22,7 @@ Add this to `mise.toml`:
 
 ```toml
 [tools]
-"github:titouanmathis/ddev-tailnet-proxy" = "0.1.0"
+"github:titouanmathis/ddev-tailnet-proxy" = "0.1.1"
 ```
 
 Then install the system service:
@@ -38,9 +38,9 @@ Mise's GitHub backend finds the executable at `bin/ddev-tailnet-proxy` in the re
 Download the release archive and its checksum from GitHub. Verify it, then put `bin/ddev-tailnet-proxy` on your `PATH`:
 
 ```sh
-sha256sum -c ddev-tailnet-proxy-0.1.0.tar.gz.sha256
-tar -xzf ddev-tailnet-proxy-0.1.0.tar.gz
-sudo install -m 755 ddev-tailnet-proxy-0.1.0/bin/ddev-tailnet-proxy /usr/local/bin/ddev-tailnet-proxy
+sha256sum -c ddev-tailnet-proxy-0.1.1.tar.gz.sha256
+tar -xzf ddev-tailnet-proxy-0.1.1.tar.gz
+sudo install -m 755 ddev-tailnet-proxy-0.1.1/bin/ddev-tailnet-proxy /usr/local/bin/ddev-tailnet-proxy
 sudo ddev-tailnet-proxy service install
 ```
 
@@ -50,7 +50,7 @@ sudo ddev-tailnet-proxy service install
 
 ```text
 sudo ddev-tailnet-proxy refresh
-sudo ddev-tailnet-proxy status
+ddev-tailnet-proxy status
 sudo ddev-tailnet-proxy config set-node-dns NAME
 sudo ddev-tailnet-proxy config unset-node-dns
 sudo ddev-tailnet-proxy config show
@@ -59,7 +59,7 @@ sudo ddev-tailnet-proxy service uninstall
 sudo ddev-tailnet-proxy service status
 ```
 
-Run every command except `help` with `sudo`. The state files are root-only because the service owns the proxy and its Tailscale Serve routes.
+Run `refresh`, `config`, and `service` commands with `sudo`. `status` reads a public summary written by the root-owned service, so it does not require root.
 
 The tool normally detects the node name from `tailscale status --json`. If your Tailscale version does not return `Self.DNSName`, set it explicitly:
 
@@ -74,8 +74,9 @@ The timer runs one minute after boot and every two minutes after that. Run `sudo
 | Path | Purpose | Mode |
 | --- | --- | --- |
 | `/etc/ddev-tailnet-proxy/config` | Optional DNS override and settings | root, `0600` |
-| `/var/lib/ddev-tailnet-proxy/ports.tsv` | Stable project-to-port assignments | root, `0600` |
+| `/var/lib/ddev-tailnet-proxy/ports.tsv` | Stable project-to-port assignments | root, `0644` |
 | `/var/lib/ddev-tailnet-proxy/served-ports.tsv` | Tailscale Serve routes owned by this tool | root, `0600` |
+| `/var/lib/ddev-tailnet-proxy/status` | Public status summary | root, `0644` |
 | `/var/lib/ddev-tailnet-proxy/nginx.conf` | Generated Nginx configuration | root, `0600` |
 | `/var/log/ddev-tailnet-proxy` | Reserved service log directory | root, `0750` |
 
@@ -88,10 +89,10 @@ The generated Nginx configuration disables upstream TLS verification because DDE
 No Node.js, npm, or Make is required. Create a GitHub release asset with standard Linux utilities:
 
 ```sh
-scripts/release.sh 0.1.0
+scripts/release.sh 0.1.1
 ```
 
-This creates `dist/ddev-tailnet-proxy-0.1.0.tar.gz` and a checksum file that verifies when downloaded beside the archive. Upload both files to a GitHub release with the matching tag.
+This creates `dist/ddev-tailnet-proxy-0.1.1.tar.gz` and a checksum file that verifies when downloaded beside the archive. Upload both files to a GitHub release with the matching tag.
 
 Run the minimal validation:
 

@@ -10,6 +10,7 @@ readonly LOG_DIR="${DDEV_TAILNET_PROXY_LOG_DIR:-/var/log/ddev-tailnet-proxy}"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
 readonly PORTS_FILE="$STATE_DIR/ports.tsv"
 readonly SERVED_PORTS_FILE="$STATE_DIR/served-ports.tsv"
+readonly STATUS_FILE="$STATE_DIR/status"
 readonly NGINX_CONF="$STATE_DIR/nginx.conf"
 readonly CONTAINER_NAME="ddev-tailnet-proxy"
 readonly DEFAULT_BASE_PORT=19001
@@ -92,11 +93,13 @@ node_dns() {
 init_paths() {
   require_root
   umask 077
-  install -d -m 700 "$CONFIG_DIR" "$STATE_DIR"
+  install -d -m 700 "$CONFIG_DIR"
+  install -d -m 755 "$STATE_DIR"
   install -d -m 750 "$LOG_DIR"
   [[ -f $PORTS_FILE ]] || : > "$PORTS_FILE"
   [[ -f $SERVED_PORTS_FILE ]] || : > "$SERVED_PORTS_FILE"
-  chmod 600 "$PORTS_FILE" "$SERVED_PORTS_FILE"
+  chmod 644 "$PORTS_FILE"
+  chmod 600 "$SERVED_PORTS_FILE"
 }
 
 port_in_use() {
@@ -273,20 +276,25 @@ refresh() {
   sort -u -o "$PORTS_FILE" "$PORTS_FILE"
   apply_proxy "$active_file"
   apply_tailscale_serve "$active_file"
+  {
+    printf 'Node DNS: %s\n' "$(node_dns)"
+    if [[ -s $PORTS_FILE ]]; then
+      printf '\n%-28s %s\n' PROJECT PORT
+      awk -F '\t' '{ printf "%-28s %s\n", $1, $2 }' "$PORTS_FILE"
+    else
+      printf '\nNo project ports are allocated.\n'
+    fi
+  } > "$STATUS_FILE"
+  chmod 644 "$STATUS_FILE"
   date --iso-8601=seconds > "$STATE_DIR/last-refresh"
   log "refresh complete"
 }
 
 show_status() {
-  require_root
-  load_config
-  printf 'Node DNS: %s\n' "$(node_dns)"
-  printf 'Config: %s\nState: %s\n' "$CONFIG_DIR" "$STATE_DIR"
-  if [[ -s $PORTS_FILE ]]; then
-    printf '\n%-28s %s\n' PROJECT PORT
-    awk -F '\t' '{ printf "%-28s %s\n", $1, $2 }' "$PORTS_FILE"
+  if [[ -r $STATUS_FILE ]]; then
+    cat "$STATUS_FILE"
   else
-    printf '\nNo project ports are allocated.\n'
+    printf 'No refresh state is available. Run sudo %s refresh.\n' "$PROGRAM"
   fi
   if command -v systemctl >/dev/null; then
     printf '\n'
