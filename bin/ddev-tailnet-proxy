@@ -189,6 +189,15 @@ generate_nginx_config() {
       proxy_set_header Host \$ddev_host;
       proxy_set_header Accept-Encoding "";
 
+      # Development CMS responses carry far bigger headers than nginx's 4k
+      # default buffer, and nginx answers 502 "upstream sent too big header"
+      # rather than truncating. A Drupal site with
+      # http.response.debug_cacheability_headers enabled sends an
+      # X-Drupal-Cache-Tags header of about 5 KB on a single page.
+      proxy_buffer_size 32k;
+      proxy_buffers 8 32k;
+      proxy_busy_buffers_size 64k;
+
       proxy_redirect https://\$ddev_host/ https://$public_dns:\$server_port/;
       proxy_cookie_domain \$ddev_host $public_dns;
 
